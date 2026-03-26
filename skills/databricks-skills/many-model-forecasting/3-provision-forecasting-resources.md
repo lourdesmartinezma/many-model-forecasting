@@ -133,6 +133,20 @@ This determines the specific node types.
 
 ### Step 4: Check existing clusters
 
+> ⚠️ SKIP THIS STEP IN PRACTICE — lourdes.martinez@databricks.com, 2026-03-26
+>
+> `list_clusters` returns all clusters in the workspace (300k+ chars). Filtering
+> for matching runtime/node-type is not practical and the result often exceeds
+> context limits. Since clusters are **ephemeral job clusters** (created per
+> Workflow run, not long-lived), there is rarely a useful match to reuse.
+>
+> PROPOSED FIX: Replace `list_clusters` with a targeted `get_best_cluster` MCP
+> call or a direct cluster search by name, OR make this step opt-in (only run if
+> the user explicitly says they have an existing cluster they want to reuse).
+>
+> CURRENT BEHAVIOR: Skip Step 4 entirely and proceed directly to Step 5.
+
+<!-- ORIGINAL STEP 4 (preserved for reference):
 Use MCP `list_clusters` to find clusters matching the required configurations:
 - Match by runtime version (`17.3.x-cpu-ml-scala2.13` for CPU, `18.0.x-gpu-ml-scala2.13` for GPU)
 - Match by node type for the target cloud provider
@@ -147,6 +161,7 @@ elif matching_cluster.state == "TERMINATED":
 else:
     → Proceed to generate ephemeral job cluster config
 ```
+-->
 
 ### Step 5: Select cluster configuration
 

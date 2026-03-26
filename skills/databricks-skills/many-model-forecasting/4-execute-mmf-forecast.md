@@ -243,11 +243,88 @@ All notebooks were saved to the **local project directory** in Step 3. Now uploa
 - `notebooks/{use_case}/orchestrator_global` — global models orchestrator (if applicable)
 - `notebooks/{use_case}/orchestrator_foundation` — foundation models orchestrator (if applicable)
 
-The local copies in `notebooks/{use_case}/` serve as version-controllable artifacts of the generated pipeline.
+<!-- BUG IDENTIFIED: 2026-03-26 — lourdes.martinez@databricks.com
+     PROBLEM: The Databricks CLI `workspace import` command accepts only ONE positional
+     argument (the TARGET_PATH in the workspace). The local file must be passed via the
+     --file flag, NOT as a second positional argument. Passing two positional args raises:
+       "Error: accepts 1 arg(s), received 2"
+
+     Additionally, the MCP upload_file tool uses ImportFormat.AUTO internally, which does
+     not recognize .py Databricks notebook format — see Bug 3 in workspace.py. Use the
+     CLI directly as the workaround.
+
+     ORIGINAL (broken — caused "accepts 1 arg(s), received 2" error):
+     databricks workspace import <local.py> <workspace_path> --format SOURCE --language PYTHON --overwrite
+
+     PROPOSED FIX (⚠️ fix proposal — validated in execution 2026-03-26, requires thorough testing):
+     Use --file flag for the local path. See corrected command below.
+-->
+
+Use the Databricks CLI with `--file` flag and fully qualified workspace path from `get_current_user()`:
+
+```bash
+# FIX PROPOSAL (⚠️ requires thorough testing):
+databricks workspace import {home_path}/mmf-skills-test/notebooks/{use_case}/{notebook_name} \
+  --file generated_notebooks/{use_case}/{notebook_name}.py \
+  --format SOURCE --language PYTHON --overwrite \
+  --profile {profile}
+```
+
+Where `{home_path}` = `get_current_user().home_path` (e.g. `/Workspace/Users/user@example.com`).
+
+**Do NOT use relative workspace paths. Do NOT use the MCP `upload_file` tool for .py notebooks (ImportFormat.AUTO bug).**
+
+The local copies in `generated_notebooks/{use_case}/` serve as version-controllable artifacts of the generated pipeline.
 
 ### Step 5: Create one job per model class (triggered in parallel)
 
 **Create separate Workflow jobs for each model class and trigger them all in parallel.** This maximizes throughput — local models run on CPU while GPU models run concurrently.
+
+#### ⛔ GUARDRAIL — Step 5a: Job ownership check before creating jobs
+
+<!-- BUG IDENTIFIED: 2026-03-26 — lourdes.martinez@databricks.com
+     PROBLEM:
+     `manage_jobs(action='create')` is idempotent by name — if a job with the
+     same name already exists (owned by ANY user), it silently returns that
+     existing job instead of creating a new one. If that job was created by a
+     different user (e.g. a colleague who ran the same use case), the current
+     user cannot update its notebook path or config, causing either silent
+     misruns (wrong notebook) or permission errors on subsequent runs.
+
+     This was observed in Skill 2 (profiling job owned by a different colleague
+     was returned instead of creating a new one for the current user). The same
+     failure mode applies here for the 3 forecasting jobs.
+
+     PROPOSED FIX / CURRENT GUARDRAIL:
+     Always perform these 3 steps before calling manage_jobs(action='create'):
+
+     1. Call get_current_user() to obtain the authenticated username.
+     2. Build job names that include the username (without @domain) and date,
+        making them unique per user per day:
+          {use_case}_local_forecasting_{username}_{YYYYMMDD}
+          {use_case}_global_forecasting_{username}_{YYYYMMDD}
+          {use_case}_foundation_forecasting_{username}_{YYYYMMDD}
+        Example: synthetic_local_forecasting_lourdes.martinez_20260326
+     3. Call find_by_name() for each job name before creating it. If a match is
+        found, call get() to verify the creator_user_name matches the current
+        user before reusing or updating it. If it belongs to another user,
+        append a counter suffix (_2, _3, ...) until a free name is found.
+
+     WHY username in name (not just date):
+     Multiple users may run the same use case on the same day. Including the
+     username guarantees isolation without requiring a shared naming registry.
+
+     NOTE: This guardrail is a copy of the one in Skill 2
+     (2-profile-and-classify-series.md Step 5a). It was added here because Skill
+     4 can be run independently of Skill 2, and the guardrail must be present
+     wherever jobs are created.
+-->
+
+**Before creating any job:**
+1. Call `get_current_user()` to get the authenticated username (strip `@domain`).
+2. Use job name pattern: `{use_case}_{class}_forecasting_{username}_{YYYYMMDD}`
+   - Example: `synthetic_local_forecasting_lourdes.martinez_20260326`
+3. Call `find_by_name()` for each name. If a job already exists, call `get()` and verify `creator_user_name` matches current user before reusing.
 
 #### Job 1: Local models (if any local models selected)
 

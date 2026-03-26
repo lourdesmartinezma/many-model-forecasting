@@ -103,18 +103,176 @@ Replace these placeholders:
 
 ### Step 4: Save notebook locally and upload
 
+<!-- ============================================================
+  MODIFICATION: Notebook upload path correction
+  Author:       lourdes.martinez@databricks.com
+  Date:         2026-03-26
+
+  Problem found during execution:
+    The original upload path `notebooks/{use_case}/run_profiling` was
+    relative and ambiguous. The upload_file tool resolved it to the
+    workspace root (/Workspace/notebooks/) or /Workspace/Shared/notebooks/
+    depending on how the path was specified — both wrong locations.
+    Notebooks ended up scattered in unexpected places instead of in a
+    clean, user-owned project folder.
+
+  What the original instruction said (kept below for reference):
+    "Then upload it to the Databricks workspace at
+     `notebooks/{use_case}/run_profiling`."
+
+  How it was fixed:
+    Always use a fully qualified workspace path rooted at the user's
+    home directory, under a dedicated project folder (mmf-skills-test).
+    This keeps all notebooks organized, user-owned, and easy to find.
+============================================================ -->
+
+<!-- ============================================================
+  MODIFICATION: Notebook format conversion before upload
+  Author:       lourdes.martinez@databricks.com
+  Date:         2026-03-26
+
+  Problem found during execution:
+    Templates are authored as .ipynb (Jupyter format) for readability.
+    When upload_file() uploads a .ipynb directly to the Databricks
+    workspace, Databricks does NOT recognize it as a runnable notebook —
+    it treats it as a generic file. The job then fails immediately with:
+    "'path' is not a notebook."
+    This happened repeatedly across multiple upload attempts.
+
+  What the original instruction said (kept below for reference):
+    "Save the generated notebook to: notebooks/{use_case}/run_profiling.ipynb
+     Then upload it to the Databricks workspace at notebooks/{use_case}/run_profiling"
+
+  How it was fixed:
+    Keep templates as .ipynb (easier to maintain and edit visually).
+    Before uploading, convert the generated .ipynb to Databricks Python
+    notebook format (.py) using the conversion rules below.
+    Databricks natively recognizes this format without any import API.
+============================================================ -->
+
+<!-- ORIGINAL (uploaded .ipynb directly — Databricks rejected it as not a notebook):
 Save the generated notebook to the **local project directory** at:
 - `notebooks/{use_case}/run_profiling.ipynb`
 
 Then upload it to the Databricks workspace at `notebooks/{use_case}/run_profiling`.
+-->
+
+**Step 4a — Generate from template (local):**
+
+Save the generated notebook locally at:
+- `generated_notebooks/{use_case}/run_profiling.ipynb`
+
+**Step 4b — Convert to Databricks Python format:**
+
+Convert the `.ipynb` to a `.py` Databricks notebook using these rules:
+- First line: `# Databricks notebook source`
+- Cells separated by: `# COMMAND ----------`
+- Markdown cells: prefix each line with `# MAGIC %md` / `# MAGIC <content>`
+- Magic commands (`%pip`, `%restart_python`, etc.): prefix with `# MAGIC`
+- Code cells: paste as-is
+
+Save the result as `generated_notebooks/{use_case}/run_profiling.py`.
+
+**Step 4c — Upload using fully qualified workspace path:**
+
+Upload the `.py` file to:
+- `{home_path}/mmf-skills-test/notebooks/{use_case}/run_profiling`
+
+Where `{home_path}` comes from `get_current_user()` (e.g. `/Workspace/Users/lourdes.martinez@databricks.com`).
+
+**Do NOT upload the `.ipynb` directly. Do NOT use relative paths.**
 
 ### Step 5: Create Workflow job on serverless compute
+
+<!-- ============================================================
+  MODIFICATION: Job ownership guardrail
+  Author:       lourdes.martinez@databricks.com
+  Date:         2026-03-26
+
+  Problem found during execution:
+    The `manage_jobs(action='create')` tool is idempotent — if a job with
+    the same name already exists (created by another user in a shared
+    workspace), it silently returns the existing job instead of creating
+    a new one. The agent then ran that foreign job, which pointed to a
+    different notebook and ran under a different identity, producing wrong
+    results with no obvious error. Two failed runs occurred before the
+    root cause was identified.
+
+  What the original code did (kept below for reference):
+    Generated a fixed job name `{use_case}_profiling` and called
+    create_job directly without checking ownership first.
+
+  How it was fixed:
+    1. Always call get_current_user() first to know the identity.
+    2. Always call find_by_name() BEFORE create_job to detect conflicts.
+    3. Use a default name that includes the full username and date to
+       practically guarantee uniqueness: {use_case}_profiling_{user}_{YYYYMMDD}
+    4. If a job with that name already exists and belongs to the current
+       user, ask whether to reuse or create a new one.
+    5. If it belongs to another user (edge case), generate a new name
+       with a more precise timestamp.
+    6. Never run a job owned by another user.
+============================================================ -->
+
+<!-- ORIGINAL CODE (no ownership check — caused wrong job to run):
+### Step 5: Create Workflow job on serverless compute
+
+Create a single-task Workflow job on **serverless compute**:
+
+```json
+{
+  "name": "{use_case}_profiling",
+  "tasks": [{
+    "task_key": "profile_series",
+    "notebook_task": {
+      "notebook_path": "notebooks/{use_case}/run_profiling"
+    },
+    "environment_key": "Default"
+  }],
+  "environments": [{
+    "environment_key": "Default",
+    "spec": { "client": "1" }
+  }]
+}
+```
+
+Use `create_job` to create the job, then `run_job` to start it.
+-->
+
+#### ⛔ GUARDRAIL — Step 5a: Check for existing job before creating
+
+**Default job name pattern:**
+
+```
+{use_case}_profiling_{username_without_domain}_{YYYYMMDD}
+```
+
+Where `{username_without_domain}` is the part of the email before `@` (e.g. `lourdes.martinez` from `lourdes.martinez@databricks.com`).
+
+Example: `synthetic_profiling_lourdes.martinez_20260326`
+
+This naming practically guarantees uniqueness by combining use case + username + date, while keeping the name readable.
+
+**Before calling `create_job`, always run these steps in order:**
+
+1. Call `get_current_user()`. Store as `{current_user}`.
+2. Generate the default name: `{use_case}_profiling_{current_user}_{YYYYMMDD}`.
+3. Call `find_by_name(name=<default_name>)` to check if it already exists.
+4. **If no job is found:** propose the default name to the user via `AskUserQuestion`, offering a custom name as an alternative. Use whichever name the user confirms.
+5. **If a job is found with that name:**
+   - Since the name includes the current user, it should always belong to the current user.
+   - Ask the user: reuse the existing job, or create a new one (append `_v2`, `_v3`, etc.)?
+6. **If somehow a job with that name is owned by a different user** (edge case): do NOT use it. Generate a new name with a more precise timestamp (append `_HHMMSS`) and inform the user.
+
+**Do NOT skip this check. Do NOT run a job owned by another user.**
+
+#### Step 5b: Create the job
 
 Create a single-task Workflow job on **serverless compute** (profiling is CPU-bound and benefits from instant startup):
 
 ```json
 {
-  "name": "{use_case}_profiling",
+  "name": "<confirmed_job_name>",
   "tasks": [{
     "task_key": "profile_series",
     "notebook_task": {

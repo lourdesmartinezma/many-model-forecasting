@@ -309,8 +309,32 @@ The `SEQUENCE` interval must match the detected frequency (same as Step 7a).
 
 Then apply the chosen imputation on the now-explicit NULLs:
 
-- **Linear interpolation**: `(LAG(y IGNORE NULLS) + LEAD(y IGNORE NULLS)) / 2`
-- **Forward fill**: `LAST_VALUE(y IGNORE NULLS) OVER (PARTITION BY unique_id ORDER BY ds)`
+<!-- BUG IDENTIFIED: 2026-03-26 — lourdes.martinez@databricks.com
+     PROBLEM: The original linear interpolation expression uses LAG(y IGNORE NULLS),
+     which is invalid Databricks SQL syntax. Databricks requires IGNORE NULLS to be
+     placed OUTSIDE the function call (not inside the parentheses). The query fails
+     with a syntax error at runtime.
+     The same issue applies to LEAD(y IGNORE NULLS).
+
+     PROPOSED FIX (⚠️ requires thorough testing — not yet validated in execution):
+     Use LAST_VALUE / FIRST_VALUE with IGNORE NULLS outside the call, combined with
+     a window frame to approximate the average of the previous and next known values.
+     See corrected expression below.
+
+     ORIGINAL (broken — kept for reference):
+     - Linear interpolation: (LAG(y IGNORE NULLS) + LEAD(y IGNORE NULLS)) / 2
+-->
+
+- **Linear interpolation** *(fix proposal — ⚠️ requires thorough testing)*:
+  ```sql
+  (LAST_VALUE(y IGNORE NULLS) OVER (PARTITION BY unique_id ORDER BY ds
+     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+   +
+   FIRST_VALUE(y IGNORE NULLS) OVER (PARTITION BY unique_id ORDER BY ds
+     ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING)
+  ) / 2.0
+  ```
+- **Forward fill**: `LAST_VALUE(y IGNORE NULLS) OVER (PARTITION BY unique_id ORDER BY ds ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`
 - **Fill with 0**: `COALESCE(y, 0)` — appropriate for count/demand data where absence means zero activity
 - **Exclusion**: Remove series exceeding the threshold from `{use_case}_train_data`
 
@@ -415,22 +439,54 @@ AskUserQuestion:
 
 If the user chooses (a), (b), or (c), apply capping using the chosen `{iqr_multiplier}`:
 
+<!-- BUG IDENTIFIED: 2026-03-26 — lourdes.martinez@databricks.com
+     PROBLEM: The original capping query uses UPDATE ... FROM ... syntax, which is
+     NOT supported in Databricks SQL. Databricks does not allow a FROM clause in
+     UPDATE statements — it raises a parse error at runtime.
+
+     PROPOSED FIX (⚠️ requires thorough testing — validated once in execution 2026-03-26):
+     Replace with CREATE OR REPLACE TABLE ... AS SELECT ... JOIN pattern.
+     This rewrites the full table with capped values in a single scan, which is
+     also more performant on Delta than row-by-row UPDATE.
+
+     ORIGINAL (broken — kept for reference):
+     UPDATE {catalog}.{schema}.{use_case}_train_data AS t
+     SET y = CASE
+       WHEN t.y < s.q1 - {iqr_multiplier} * s.iqr THEN s.q1 - {iqr_multiplier} * s.iqr
+       WHEN t.y > s.q3 + {iqr_multiplier} * s.iqr THEN s.q3 + {iqr_multiplier} * s.iqr
+       ELSE t.y
+     END
+     FROM (
+       SELECT unique_id,
+              PERCENTILE(y, 0.25) AS q1,
+              PERCENTILE(y, 0.75) AS q3,
+              PERCENTILE(y, 0.75) - PERCENTILE(y, 0.25) AS iqr
+       FROM {catalog}.{schema}.{use_case}_train_data
+       GROUP BY unique_id
+     ) s
+     WHERE t.unique_id = s.unique_id
+-->
+
 ```sql
-UPDATE {catalog}.{schema}.{use_case}_train_data AS t
-SET y = CASE
-  WHEN t.y < s.q1 - {iqr_multiplier} * s.iqr THEN s.q1 - {iqr_multiplier} * s.iqr
-  WHEN t.y > s.q3 + {iqr_multiplier} * s.iqr THEN s.q3 + {iqr_multiplier} * s.iqr
-  ELSE t.y
-END
-FROM (
+-- FIX PROPOSAL (⚠️ requires thorough testing):
+CREATE OR REPLACE TABLE {catalog}.{schema}.{use_case}_train_data AS
+SELECT
+  t.unique_id,
+  t.ds,
+  CASE
+    WHEN t.y < s.q1 - {iqr_multiplier} * s.iqr THEN s.q1 - {iqr_multiplier} * s.iqr
+    WHEN t.y > s.q3 + {iqr_multiplier} * s.iqr THEN s.q3 + {iqr_multiplier} * s.iqr
+    ELSE t.y
+  END AS y
+FROM {catalog}.{schema}.{use_case}_train_data t
+JOIN (
   SELECT unique_id,
          PERCENTILE(y, 0.25) AS q1,
          PERCENTILE(y, 0.75) AS q3,
          PERCENTILE(y, 0.75) - PERCENTILE(y, 0.25) AS iqr
   FROM {catalog}.{schema}.{use_case}_train_data
   GROUP BY unique_id
-) s
-WHERE t.unique_id = s.unique_id
+) s ON t.unique_id = s.unique_id
 ```
 
 Log the count of capped values per series for the cleaning report.
